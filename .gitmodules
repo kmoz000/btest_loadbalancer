@@ -1,0 +1,3 @@
+[submodule "btest-opensource"]
+	path = btest-opensource
+	url = git@github.com:kmoz000/btest-opensource.git
