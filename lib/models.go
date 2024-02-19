@@ -6,6 +6,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/netip"
 	"regexp"
 	"strconv"
 	"sync"
@@ -30,6 +31,7 @@ type Server struct {
 type Peer struct {
 	connected_at time.Time
 	ip           string
+	action       Action
 }
 type Server_ struct {
 	Host string `yaml:"host"`
@@ -175,7 +177,7 @@ func (lb *LoadBalancer) All() map[string]Server {
 //			sockc <- make(chan interface{})
 //		}
 //	}
-func (lb *LoadBalancer) handleTCP() {
+func (lb *LoadBalancer) handleTCP(notify chan bool) {
 	if lb.TryLock() {
 		defer lb.Unlock()
 	}
@@ -183,48 +185,51 @@ func (lb *LoadBalancer) handleTCP() {
 		// Accept new connections
 		name, _server := lb.serverPool()
 		if conn, err := lb.TCPSock.Accept(); err == nil && _server != nil {
-			if _, ok := lb.AliveNodes[name]; ok {
-				host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
-				if err != nil {
-					log.Default().Printf("failed to split host and port: %s", err)
-					return
-				}
-				_server.Peers = append(lb.AliveNodes[name].Peers, Peer{
-					ip:           host,
-					connected_at: time.Now(),
-				})
-				lb.AliveNodes[name] = *_server
-			}
-			go lb.handleTCPConn(conn, _server, name)
+			action := make(chan Action, 100)
+			portchan := make(chan uint16, 100)
+			go lb.handleTCPConn(conn, _server, action, portchan, name)
+			go lb.handlePeer(conn, &action, &portchan, _server, name)
+			go handleUDPConn(conn.RemoteAddr(), _server, portchan)
 		}
 	}
+	notify <- true
 }
-func (lb *LoadBalancer) handleUDP() {
-	buffer := make([]byte, 1500)
 
-	for lb.UDPSock != nil {
-		// Read from UDP connection
-		n, addr, err := lb.UDPSock.ReadFromUDP(buffer)
-		if err != nil {
-			fmt.Println("Error reading from UDP:", err)
-			continue
-		}
+// func (lb *LoadBalancer) handleUDP(notify chan bool) {
+// 	buffer := make([]byte, 1501)
 
-		name, _server := lb.serverPool()
-		// if _, ok := lb.AliveNodes[name]; ok && _server != nil {
-		// 	_server.Peers = append(lb.AliveNodes[name].Peers, Peer{
-		// 		ip:           addr.String(),
-		// 		connected_at: time.Now(),
-		// 	})
-		// 	lb.AliveNodes[name] = *_server
-		// }
-
-		go lb.handleUDPConn(lb.UDPSock, addr, _server, name, buffer[:n])
-	}
-}
-func (lb *LoadBalancer) handleTCPConn(us net.Conn, server *Server, name string) {
-	dicon := make(chan string, 10)
-	ds, err := net.Dial("tcp", net.JoinHostPort(server.Host, strconv.Itoa(server.Bind[0].Port)))
+//		for lb.UDPSock != nil {
+//			// Read from UDP connection
+//			var err error
+//			n, sender, err := lb.UDPSock.ReadFromUDP(buffer)
+//			if err != nil {
+//				log.Default().Println("Error reading from UDP:", err)
+//				continue
+//			}
+//			var clientCon *net.UDPConn
+//			if clientCon, err = net.DialUDP("udp4", nil, sender); err != nil {
+//				continue
+//			}
+//			name, _server := lb.serverPool()
+//			// if _, ok := lb.AliveNodes[name]; ok && _server != nil {
+//			// 	_server.Peers = append(lb.AliveNodes[name].Peers, Peer{
+//			// 		ip:           addr.String(),
+//			// 		connected_at: time.Now(),
+//			// 	})
+//			// 	lb.AliveNodes[name] = *_server
+//			// }
+//			if _server != nil && n > 0 {
+//				go handleUDPConn(clientCon, sender, _server, name, buffer[:n])
+//			}
+//		}
+//		notify <- true
+//	}
+func (lb *LoadBalancer) handleTCPConn(us net.Conn, server *Server, action chan Action, portchan chan uint16, name string) {
+	dicon := make(chan string, 1)
+	ds, err := net.DialTCP("tcp",
+		// net.TCPAddrFromAddrPort(netip.MustParseAddrPort(us.RemoteAddr().String())),
+		nil,
+		net.TCPAddrFromAddrPort(netip.MustParseAddrPort(net.JoinHostPort(server.Host, strconv.Itoa(server.Bind[0].Port)))))
 	if err != nil {
 		us.Close()
 		log.Printf("failed to dial %s: %s", server.Host, err)
@@ -235,51 +240,41 @@ func (lb *LoadBalancer) handleTCPConn(us net.Conn, server *Server, name string) 
 		log.Default().Printf("failed to split host and port: %s", err)
 		return
 	}
-	go copyConn(ds, us, nil, "")
-	go copyConn(us, ds, &dicon, host)
-	go lb.handleDisconnectedPeers(&dicon, server, name)
-}
-func (lb *LoadBalancer) handleUDPConn(conn *net.UDPConn, clientAddr *net.UDPAddr, server *Server, serverName string, data []byte) {
-	_, port, err := net.SplitHostPort(clientAddr.String())
-	if err != nil {
-		log.Default().Printf("failed to split host and port: %s", err)
-		return
-	}
-	clientPort, err := strconv.Atoi(port)
-	if err != nil {
-		log.Default().Printf("failed to convert client port to integer: %s", err)
-		return
-	}
-
-	serverAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(server.Host, strconv.Itoa(clientPort-256)))
-	if err != nil {
-		log.Default().Printf("failed to resolve server address: %s", err)
-		return
-	}
-
-	serverConn, err := net.DialUDP("udp", nil, serverAddr)
-	if err != nil {
-		log.Default().Printf("failed to dial server: %s", err)
-		return
-	}
-	defer serverConn.Close()
-	// Handle the two-way UDP data streaming
-	go copyUDPData(serverConn, clientAddr, data)
-	go copyUDPData(conn, serverAddr, data)
+	go copyConn(ds, us, nil, action, portchan, "")
+	go copyConn(us, ds, &dicon, nil, portchan, host)
+	go lb.handleDisconnectedPeers(&dicon, portchan, action, server, name)
 }
 
-func (lb *LoadBalancer) handleDisconnectedPeers(dicon *chan string, server *Server, name string) {
+func (lb *LoadBalancer) handleDisconnectedPeers(dicon *chan string, portchan chan uint16, action chan Action, server *Server, name string) {
 	for {
 		disconnectedIP := <-*dicon
 		lb.deletePeerByIP(name, disconnectedIP)
+		// close(portchan)
+		// close(action)
+	}
+}
+func (lb *LoadBalancer) handlePeer(conn net.Conn, action *chan Action, portchan *chan uint16, server *Server, name string) {
+	for {
+		PeerAction := <-*action
+		if _, ok := lb.AliveNodes[name]; ok && PeerAction.TxSize > 0 {
+			log.Default().Printf("cmd: %v, %s", PeerAction, name)
+			host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+			if err != nil {
+				log.Default().Printf("failed to split host and port: %s", err)
+				return
+			}
+			server.Peers = append(lb.AliveNodes[name].Peers, Peer{
+				ip:           host,
+				connected_at: time.Now(),
+				action:       PeerAction,
+			})
+			lb.AliveNodes[name] = *server
+		}
 	}
 }
 
 // serverPool retrieves the server with lower pinging and fewer peers.
 func (lb *LoadBalancer) serverPool() (string, *Server) {
-	if lb.TryLock() {
-		defer lb.Unlock()
-	}
 	var selectedServer *Server
 	var selectedName string
 	minPinging := int64(math.MinInt64)
@@ -314,18 +309,18 @@ func (lb *LoadBalancer) updateSocks(socks chan interface{}) {
 		Port: 2000,
 		IP:   net.IPv4(0, 0, 0, 0),
 	}
-	udpaddr := net.UDPAddr{
-		Port: 0,
-		IP:   net.IPv4(0, 0, 0, 0),
-	}
+	// udpaddr := net.UDPAddr{
+	// 	Port: 0,
+	// 	IP:   net.IPv4(0, 0, 0, 0),
+	// }
 	if lb.TCPSock, err = net.ListenTCP("tcp", &tcpaddr); err != nil {
-		log.Default().Output(0, err.Error())
+		log.Default().Println("Listner: ", err.Error())
 		return
 	}
-	if lb.UDPSock, err = net.ListenUDP("udp", &udpaddr); err != nil {
-		log.Default().Output(0, err.Error())
-		return
-	}
+	// if lb.UDPSock, err = net.ListenPacket("udp4", &udpaddr); err != nil {
+	// 	log.Default().Output(0, err.Error())
+	// 	return
+	// }
 	socks <- make(chan interface{})
 }
 
@@ -464,4 +459,15 @@ func (lb *LoadBalancer) DashboardRender(lbchan chan LoadBalancer) {
 // Config represents the overall configuration structure
 type Config struct {
 	Servers map[string]Server `yaml:"servers"`
+}
+
+// Action struct to represent an action
+type Action struct {
+	Proto         string
+	Direction     string
+	Random        bool
+	TCPConnCount  int
+	TxSize        uint16
+	Unknown       uint32
+	RemoteTxSpeed uint32
 }

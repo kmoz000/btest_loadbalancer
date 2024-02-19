@@ -1,7 +1,10 @@
 servers:
   server1:
+    host: "192.168.1.29"
+    bind: "2000/tcp, 2001-2256/udp"
+  server3:
     host: "64.202.217.236"
     bind: "2000/tcp, 2001-2256/udp"
-  server2:
-    host: "64.20.217.236" # false one to test
-    bind: "2000/tcp, 2001-2256/udp"
+  # server2:
+  #   host: "64.20.217.236" # false one to test
+  #   bind: "2000/tcp, 2001-2256/udp"

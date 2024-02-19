@@ -41,6 +41,7 @@ require (
 
 require (
 	github.com/gin-gonic/gin v1.9.1
+	github.com/google/gopacket v1.1.19
 	github.com/manifoldco/promptui v0.9.0
 	github.com/robfig/cron v1.2.0
 	github.com/robfig/cron/v3 v3.0.1 // indirect
